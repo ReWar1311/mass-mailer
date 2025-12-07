@@ -1,130 +1,395 @@
- import nodemailer from 'nodemailer';
- import Papa from 'papaparse';
- import fs from 'fs';
- import express from 'express';
- import bodyParser from 'body-parser';
+import 'dotenv/config';
+import crypto from 'crypto';
+import express from 'express';
+import multer from 'multer';
+import nodemailer from 'nodemailer';
+import Papa from 'papaparse';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
- const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+const app = express();
+app.disable('x-powered-by');
 
- app.use(bodyParser.urlencoded({ extended: true }));
+const DEFAULTS = {
+    port: Number(process.env.PORT || 3000),
+    smtpHost: process.env.SMTP_HOST || 'smtp.gmail.com',
+    smtpPort: Number(process.env.SMTP_PORT || 465),
+    fileLimit: 5 * 1024 * 1024, // 5 MB
+    maxRecipients: 2000,
+    defaultDelayMs: 800,
+    jobTtlMs: 1000 * 60 * 30,
+};
 
- const port=3000;
- var sent=0;
- var failed=0;
-
-
-app.get("/",(req,res)=>{
-    res.render("./index.ejs")}
-)
-app.post("/submit",(req,res)=>{
-    console.log(req.body)
-    const csvContent = req.body.csvContent;
-    const jsonData = parsetojson(csvContent)
-    console.log(jsonData)
-    })
-
-
- const transporter =nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    auth: {
-        user:"YOUR EMAIL HERE",
-        pass:"YOUR PASSWORD HERE"
+const PROVIDERS = [
+    {
+        id: 'gmail',
+        name: 'Gmail / Google Workspace',
+        host: 'smtp.gmail.com',
+        port: 465,
+        docUrl: 'https://support.google.com/accounts/answer/185833?hl=en',
+        note: 'Requires 2FA + App Password',
+        badge: 'Popular',
     },
-    tls: {
-    rejectUnauthorized: false // Disables certificate validation
-  }
- });
+    {
+        id: 'outlook',
+        name: 'Outlook / Office 365',
+        host: 'smtp.office365.com',
+        port: 587,
+        docUrl: 'https://support.microsoft.com/account-billing/create-an-app-password-for-office-365-3e7c860c-b102-4ead-bd59-3392d7f43b8c',
+        note: 'Use TLS with 587',
+        badge: 'Business',
+    },
+    {
+        id: 'zoho',
+        name: 'Zoho Mail',
+        host: 'smtp.zoho.com',
+        port: 465,
+        docUrl: 'https://www.zoho.com/mail/help/zoho-smtp.html',
+        note: 'Enable IMAP/POP in Zoho settings',
+        badge: 'India favorite',
+    },
+    {
+        id: 'yahoo',
+        name: 'Yahoo Mail',
+        host: 'smtp.mail.yahoo.com',
+        port: 465,
+        docUrl: 'https://help.yahoo.com/kb/SLN15241.html',
+        note: 'Needs Yahoo App Password',
+    },
+    {
+        id: 'mailgun',
+        name: 'Mailgun',
+        host: 'smtp.mailgun.org',
+        port: 587,
+        docUrl: 'https://www.mailgun.com/blog/using-mailgun-smtp/',
+        note: 'Use domain-specific username',
+    },
+    {
+        id: 'sendgrid',
+        name: 'SendGrid',
+        host: 'smtp.sendgrid.net',
+        port: 587,
+        docUrl: 'https://docs.sendgrid.com/ui/account-and-settings/smtp-relay',
+        note: 'Username: apikey · Password: actual API key',
+    },
+];
 
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: DEFAULTS.fileLimit },
+});
 
- // Path to your CSV file
-const csvFilePath = './mailstest.csv';
-const csvData = fs.readFileSync(csvFilePath, 'utf8');
+const jobs = new Map();
+const MAX_LOGS = 200;
 
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
 
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
- // Parse the CSV file to JSON
-function parsetojson(csvFile){
- const jsonData = Papa.parse(csvFile, {
-     header: true, // Use the first row as keys for JSON
-     skipEmptyLines: true // Skip empty lines in CSV
- });
- return jsonData
- }
- // Output JSON
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const jsonData=parsetojson(csvData);
+const clearJobLater = (jobId) => {
+    setTimeout(() => jobs.delete(jobId), DEFAULTS.jobTtlMs);
+};
 
+const sanitizeRows = (rows) =>
+    rows
+        .map((row) =>
+            Object.keys(row).reduce((acc, key) => {
+                const cleanKey = key?.trim();
+                if (!cleanKey) {
+                    return acc;
+                }
+                const value = row[key];
+                acc[cleanKey] = typeof value === 'string' ? value.trim() : value;
+                return acc;
+            }, {}),
+        )
+        .filter((row) => Object.keys(row).length);
 
+const findEmailColumn = (row) => {
+    if (!row) return null;
+    const columns = Object.keys(row);
+    return (
+        columns.find((key) => /email/i.test(key)) ||
+        columns.find((key) => /mail/i.test(key)) ||
+        null
+    );
+};
 
+const personalizeTemplate = (html, dataRow) =>
+    html.replace(/\$\(([^)]+)\)/g, (_, key) => {
+        const cleanedKey = key.trim();
+        return dataRow[cleanedKey] ?? '';
+    });
 
+const parseCsv = (buffer) =>
+    Papa.parse(buffer.toString('utf-8'), {
+        header: true,
+        skipEmptyLines: true,
+        dynamicTyping: false,
+        transformHeader: (header) => header?.trim(),
+    });
 
-
- async function sendaMail(params) {
-    transporter.sendMail({
-        to:params.email1,
-        subject:"Help Us Revolutionize Foot Health & Win an Amazon Voucher! 🎁",
-        html:`<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background-color: #f9f9f9; color: #333">
-    <div style="max-width: 600px; margin: 20px auto; background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
-        <p style="font-size: 20px; margin-bottom: 10px; color: #0078d7;">Hi ${params.first_name},</p>
-        <p >We hope this message finds you well. We're a health-tech startup collaborating with a renowned chain of hospitals to address leg and foot discomfort. Your insights are crucial in developing innovative solutions that can benefit you and many others. 🌟</p>
-        
-        <h3 style="margin-top: 20px; color: #333;">Why Participate?</h3>
-        <ul style="padding-left: 20px; margin: 10px 0;">
-            <li><strong>Make a Difference:</strong> Your feedback will directly influence advancements in foot health technology.</li>
-            <li><strong>Exclusive Incentive:</strong> The first 20 participants will receive a ₹500 Amazon voucher as a token of our appreciation.</li>
-        </ul>
-        
-        <h3 style="margin-top: 20px; color: #333;">Quick Survey Details:</h3>
-        <ul style="padding-left: 20px; margin: 10px 0;">
-            <li><strong>Time to Complete:</strong> Approximately 5 minutes.</li>
-            <li><strong>Privacy Assurance:</strong> Your responses will be kept confidential and used solely for research purposes.</li>
-        </ul>
-        
-        <p style="margin-top: 20px;">
-            <a href="https://forms.gle/KjxP9uZCFRLjQGsV6" style="display: inline-block; padding: 10px 20px; background-color: #0078d7; color: #fff; text-decoration: none; border-radius: 5px; font-weight: bold;">Click here to take the survey</a>
-        </p>
-        
-        <p style="margin-top: 20px; font-size: 14px; color: #555;">Thank you for your valuable time and input. Together, let’s make a significant impact on foot health. 💡</p>
-        <p style="margin-top: 10px; font-size: 14px; color: #555;">Best regards,<br>Sole-arium Technologies</p>
-    </div>
-</body>
-`
-    }).then((info)=>{sent++,console.log(".Sent: "+sent+"failed: "+failed)}).catch((err)=>{console.log("OOPS"+err);failed++;console.log("Sent: "+sent+"failed: "+failed)})
- }
-
-
-
-
-//  sendaMail({to:"jagveermeena53@gmail.com",subject:"functional test 1",name:"Aryan"})
-//  var data=[{to:"prashantrewarjat@gmail.com",subject:"functional test 1",name:"Prashant"},{to:"prashantrewarjat@gmail.com",subject:"functional test 2",name:"Prashant"},{to:"prashantrewarjat@gmail.com",subject:"functional test 3",name:"Prashant"},{to:"prashantrewarjat@gmail.com",subject:"functional test 4",name:"Prashant"},{to:"prashantrewarjat@gmail.com",subject:"functional test 5",name:"Prashant"},{to:"prashantrewarjat@gmail.com",subject:"functional test 6",name:"Prashant"},{to:"prashantrewarjat@gmail.com",subject:"functional test 7",name:"Prashant"},{to:"prashantrewarjat@gmail.com",subject:"functional test 8",name:"Prashant"},{to:"prashantrewarjat@gmail.com",subject:"functional test 9",name:"Prashant"}]
+const getPublicState = (job) => ({
+    id: job.id,
+    status: job.status,
+    subject: job.subject,
+    total: job.total,
+    sent: job.sent,
+    failed: job.failed,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+    delayMs: job.delayMs,
+    emailColumn: job.emailColumn,
+    sampleColumns: job.sampleColumns,
+    logs: job.logs,
+});
  
+const broadcast = (job) => {
+    const payload = JSON.stringify({ type: 'state', data: getPublicState(job) });
+    for (const stream of job.streams) {
+        stream.write(`data: ${payload}\n\n`);
+    }
+};
  
- for(let i=0;i<jsonData.data.length;i++){ 
-    sendaMail(jsonData.data[i])}
+const createTransporter = ({ host, port, email, password }) =>
+    nodemailer.createTransport({
+        host,
+        port,
+        secure: Number(port) === 465,
+        auth: {
+            user: email,
+            pass: password,
+        },
+        tls: {
+            rejectUnauthorized: false,
+        },
+    }); 
 
+const runJob = async (job) => {
+    try {
+        const transporter = createTransporter(job.smtp);
+        await transporter.verify();
 
-// function myAsyncFunction(input) {
-//     return new Promise((resolve) => {
-//         // Simulate async operation
-//         setTimeout(() => {
-//             console.log(input);
-//             resolve();
-//         }, Math.random() * 10);
-//     });
-// }
- 
-// const promises = [];
-// for (let i = 0; i < 100000; i++) {
-//     promises.push(myAsyncFunction(i));
-// }
+        job.status = 'running';
+        job.startedAt = Date.now();
+        broadcast(job);
 
-// Promise.all(promises).then(() => {
-//     console.log("All operations completed");
-// });
+        for (const row of job.recipients) {
+            const to = row[job.emailColumn];
+            if (!to) {
+                job.failed += 1;
+                job.logs.unshift({
+                    kind: 'error',
+                    message: 'Missing email address in row',
+                    email: null,
+                    at: Date.now(),
+                });
+                job.logs = job.logs.slice(0, MAX_LOGS);
+                broadcast(job);
+                continue;
+            }
 
-// app.listen(port,()=>{
-//     console.log("listening on port "+port)
-// })
+            const html = personalizeTemplate(job.template, row);
+            try {
+                await transporter.sendMail({
+                    from: job.from,
+                    to,
+                    subject: job.subject,
+                    html,
+                });
+                job.sent += 1;
+                job.logs.unshift({ kind: 'success', email: to, at: Date.now() });
+            } catch (error) {
+                job.failed += 1;
+                job.logs.unshift({
+                    kind: 'error',
+                    email: to,
+                    message: error.message,
+                    at: Date.now(),
+                });
+            }
+
+            job.logs = job.logs.slice(0, MAX_LOGS);
+            broadcast(job);
+            if (job.delayMs > 0) {
+                await sleep(job.delayMs);
+            }
+        }
+
+        job.status = 'completed';
+        job.completedAt = Date.now();
+        broadcast(job);
+    } catch (error) {
+        job.status = 'failed';
+        job.completedAt = Date.now();
+        job.logs.unshift({
+            kind: 'error',
+            message: error.message,
+            at: Date.now(),
+        });
+        job.logs = job.logs.slice(0, MAX_LOGS);
+        broadcast(job);
+    } finally {
+        clearJobLater(job.id);
+    }
+};
+
+app.get('/', (req, res) => {
+    res.render('index', {
+        defaults: {
+            smtpHost: DEFAULTS.smtpHost,
+            smtpPort: DEFAULTS.smtpPort,
+            delayMs: DEFAULTS.defaultDelayMs,
+            maxRecipients: DEFAULTS.maxRecipients,
+            maxFileMb: DEFAULTS.fileLimit / (1024 * 1024),
+        },
+        providers: PROVIDERS,
+    });
+});
+
+app.post('/api/send', upload.single('contacts'), async (req, res) => {
+    try {
+        const {
+            senderEmail = '',
+            senderName = '',
+            appPassword = '',
+            subject = '',
+            message = '',
+            smtpHost = DEFAULTS.smtpHost,
+            smtpPort = DEFAULTS.smtpPort,
+            delayMs = DEFAULTS.defaultDelayMs,
+        } = req.body;
+
+        if (!req.file) {
+            return res.status(400).json({ message: 'Please upload a CSV file with your contacts.' });
+        }
+
+        if (!senderEmail.trim()) {
+            return res.status(400).json({ message: 'Sender email is required.' });
+        }
+
+        if (!appPassword.trim()) {
+            return res.status(400).json({ message: 'App password is required.' });
+        }
+
+        if (!subject.trim()) {
+            return res.status(400).json({ message: 'Subject cannot be empty.' });
+        }
+
+        if (!message.trim()) {
+            return res.status(400).json({ message: 'Message body cannot be empty.' });
+        }
+
+        const parsed = parseCsv(req.file.buffer);
+
+        if (parsed.errors?.length) {
+            const firstError = parsed.errors[0];
+            return res.status(400).json({ message: `CSV error: ${firstError.message}` });
+        }
+
+        if (!parsed.data.length) {
+            return res.status(400).json({ message: 'The CSV file has no rows.' });
+        }
+
+        const sanitizedRows = sanitizeRows(parsed.data);
+        const emailColumn = findEmailColumn(sanitizedRows[0]);
+
+        if (!emailColumn) {
+            return res.status(400).json({
+                message: 'No email column detected. Please include a column named "email".',
+            });
+        }
+
+        const recipients = sanitizedRows.filter((row) => row[emailColumn]);
+
+        if (!recipients.length) {
+            return res
+                .status(400)
+                .json({ message: 'No recipients with email addresses were found in the CSV.' });
+        }
+
+        if (recipients.length > DEFAULTS.maxRecipients) {
+            return res.status(400).json({
+                message: `This tool currently limits a single campaign to ${DEFAULTS.maxRecipients} recipients. Please split your CSV.`,
+            });
+        }
+
+        const jobId = crypto.randomUUID();
+        const job = {
+            id: jobId,
+            createdAt: Date.now(),
+            status: 'queued',
+            subject: subject.trim(),
+            template: message,
+            total: recipients.length,
+            sent: 0,
+            failed: 0,
+            delayMs: Number.isFinite(Number(delayMs)) ? Math.max(Number(delayMs), 0) : DEFAULTS.defaultDelayMs,
+            recipients,
+            emailColumn,
+            logs: [],
+            streams: new Set(),
+            from: senderName.trim()
+                ? `${senderName.trim()} <${senderEmail.trim()}>`
+                : senderEmail.trim(),
+            smtp: {
+                host: smtpHost || DEFAULTS.smtpHost,
+                port: Number(smtpPort) || DEFAULTS.smtpPort,
+                email: senderEmail.trim(),
+                password: appPassword.trim(),
+            },
+            sampleColumns: Object.keys(sanitizedRows[0] || {}),
+        };
+
+        jobs.set(jobId, job);
+        runJob(job);
+
+        return res.status(202).json({ jobId, state: getPublicState(job) });
+    } catch (error) {
+        console.error('send error', error);
+        return res.status(500).json({ message: 'Something went wrong while scheduling your campaign.' });
+    }
+});
+
+app.get('/api/jobs/:jobId', (req, res) => {
+    const job = jobs.get(req.params.jobId);
+    if (!job) {
+        return res.status(404).json({ message: 'Job not found or has expired.' });
+    }
+    return res.json(getPublicState(job));
+});
+
+app.get('/api/jobs/:jobId/stream', (req, res) => {
+    const job = jobs.get(req.params.jobId);
+    if (!job) {
+        return res.status(404).end();
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+    res.write(`data: ${JSON.stringify({ type: 'state', data: getPublicState(job) })}\n\n`);
+
+    job.streams.add(res);
+
+    req.on('close', () => {
+        job.streams.delete(res);
+    });
+});
+
+if (process.env.VERCEL !== '1') {
+    app.listen(DEFAULTS.port, () => {
+        console.log(`Mass Mailer listening on http://localhost:${DEFAULTS.port}`);
+    });
+}
+
+export default app;

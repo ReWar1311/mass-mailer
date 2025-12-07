@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+<body>
+    <form action="/submit" method="post">
+        <input type="hidden" name="csvContent" id="csvContent" />
+        <label for="file" id="task">Please Upload CSV File:</label><br>
+        <input type="file" accept=".csv" name="file" id="file"><br><br><label for="subject">Subject:</label><br>
+        <input type="text" placeholder="Subject" name="subject" id="subject"><br><br><label for="message">Message(HTML (use "<span>$(file.heading)</span>" to use csv data)):</label><br>
+        <textarea rows="5" placeholder="Message" name="message" id="message"></textarea><br><br>
+        <input type="submit" id="submitButton" value="Send">
+    </form>
+    <script>
+        const csvFileInput = document.getElementById('file');
+        const csvContentInput = document.getElementById('csvContent');
+        const submitButton = document.getElementById('submitButton');
+        const taskElement = document.getElementById('task');
+        submitButton.disabled = true; // Disable the button initially
+    
+        csvFileInput.addEventListener('change', async () => {
+          const file = csvFileInput.files[0];
+          if (file) {
+            taskElement.innerText="Uploading..."
+            // Disable the submit button initially
+
+
+            
+    
+            // Read the file as text and enable the button when ready
+            const text = await file.text();
+            csvContentInput.value = text; // Store plain text content
+            taskElement.innerText="Uploaded"
+            submitButton.disabled = false; // Enable the button
+
+          }
+        });
+      </script>
+</body>
+</html>
